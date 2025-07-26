@@ -1,0 +1,1 @@
+I'm using PlatformIO and coding for an ESP32 with a built in 320 x 240 2.8" LCD display with a touch screen called the "ESP32-2432S028R" (Cheap Yellow Display)
