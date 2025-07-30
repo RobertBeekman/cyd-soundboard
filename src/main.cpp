@@ -35,6 +35,16 @@
 #define TFT_VER_RES   240
 #define DRAW_BUF_SIZE (TFT_HOR_RES * TFT_VER_RES / 10 * (LV_COLOR_DEPTH / 8))
 
+// Grid configuration - adjust these for performance tuning
+#define GRID_COLS 4        // Number of columns per grid (was 5)
+#define GRID_ROWS 3        // Number of rows per grid (was 6)
+#define GRID_BUTTONS_MAX (GRID_COLS * GRID_ROWS)  // Maximum buttons per grid
+#define BUTTON_GAP 1       // Gap between buttons in pixels
+#define GRID_GAP 2         // Gap between grids in pixels
+
+// Default volume setting (0-21 range)
+#define DEFAULT_VOLUME 12  // Default volume if not specified in config file
+
 // Structure to hold button configuration
 struct ButtonConfig {
     String filename;
@@ -58,13 +68,12 @@ uint32_t lastTick = 0;    // Timer for LVGL
 
 // File browser variables
 lv_obj_t * file_list;     // Container for file buttons
-// Audio volume slider components
-static lv_obj_t * volSlider;
-static lv_obj_t * volSlider_label;
-static void volSlider_event_cb(lv_event_t * e);
 
 std::vector<ButtonConfig> buttonConfigs;  // Configured buttons
 std::vector<String> unconfiguredFiles;    // MP3 files not in config
+
+// Global configuration variables
+int configuredVolume = DEFAULT_VOLUME;    // Volume setting from config file
 
 // Global SD card initialization flag
 bool sdCardInitialized = false;
@@ -198,6 +207,7 @@ bool initializeSDCard() {
 /* Read and parse configuration file */
 void readConfigFile() {
     buttonConfigs.clear();
+    configuredVolume = DEFAULT_VOLUME; // Reset to default
 
     // Initialize SD card if not already done
     if (!initializeSDCard()) {
@@ -223,7 +233,19 @@ void readConfigFile() {
             continue;
         }
 
-        // Parse format: filename|label|color
+        // Check for volume setting (format: VOLUME=15)
+        if (line.startsWith("VOLUME=")) {
+            int volume = line.substring(7).toInt();
+            if (volume >= 0 && volume <= 21) {
+                configuredVolume = volume;
+                Serial.println("Volume configured to: " + String(volume) + "/21");
+            } else {
+                Serial.println("Invalid volume value: " + String(volume) + ", using default");
+            }
+            continue;
+        }
+
+        // Parse button format: filename|label|color
         int firstPipe = line.indexOf('|');
         int secondPipe = line.indexOf('|', firstPipe + 1);
 
@@ -241,7 +263,7 @@ void readConfigFile() {
     }
 
     configFile.close();
-    Serial.println("Configuration loaded: " + String(buttonConfigs.size()) + " entries");
+    Serial.println("Configuration loaded: " + String(buttonConfigs.size()) + " entries, Volume: " + String(configuredVolume) + "/21");
 }
 
 /* Scan SD card root directory and populate file list */
@@ -387,21 +409,111 @@ static void file_list_event_handler(lv_event_t * e) {
     }
 }
 
-/* Volume slider event handler */
-static void volSlider_event_cb(lv_event_t * e) {
-    lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_VALUE_CHANGED) {
-        // Get the new slider value (0-21 range)
-        int16_t value = lv_slider_get_value(volSlider);
+/* Create a configurable grid of buttons within a container */
+lv_obj_t* create_button_grid(lv_obj_t* parent, const std::vector<ButtonConfig>& configs, const std::vector<String>& unconfigured, int start_index) {
+    // Create grid container with full screen height
+    lv_obj_t* grid = lv_obj_create(parent);
+    lv_obj_set_size(grid, TFT_HOR_RES - 10, TFT_VER_RES - 10); // Use full screen size minus small margin
+    lv_obj_set_style_pad_all(grid, BUTTON_GAP, 0); // Use configurable padding
+    lv_obj_set_style_pad_gap(grid, BUTTON_GAP, 0); // Use configurable gap
+    lv_obj_remove_flag(grid, LV_OBJ_FLAG_SCROLLABLE); // Grid itself shouldn't scroll
 
-        // Set audio volume directly (assuming audioSetVolume expects 0-21 range)
-        audioSetVolume(value);
+    // Dynamically create grid descriptors based on configuration
+    static int32_t col_dsc[GRID_COLS + 1];
+    static int32_t row_dsc[GRID_ROWS + 1];
 
-        // Update volume label text
-        lv_label_set_text_fmt(volSlider_label, "Volume: %d/21", value);
-
-        Serial.println("Volume set to: " + String(value) + "/21");
+    // Fill column descriptors
+    for (int i = 0; i < GRID_COLS; i++) {
+        col_dsc[i] = LV_GRID_FR(1);
     }
+    col_dsc[GRID_COLS] = LV_GRID_TEMPLATE_LAST;
+
+    // Fill row descriptors
+    for (int i = 0; i < GRID_ROWS; i++) {
+        row_dsc[i] = LV_GRID_FR(1);
+    }
+    row_dsc[GRID_ROWS] = LV_GRID_TEMPLATE_LAST;
+
+    lv_obj_set_grid_dsc_array(grid, col_dsc, row_dsc);
+    lv_obj_set_layout(grid, LV_LAYOUT_GRID);
+
+    // Combine configured and unconfigured files
+    std::vector<std::pair<String, String>> all_files; // filename, label pairs
+
+    // Add configured files first (in order)
+    for (const auto& config : configs) {
+        if (config.found) {
+            all_files.emplace_back(config.filename, config.label);
+        }
+    }
+
+    // Add unconfigured files
+    for (const auto& fileName : unconfigured) {
+        String displayName = fileName;
+        if (displayName.endsWith(".mp3") || displayName.endsWith(".MP3")) {
+            displayName = displayName.substring(0, displayName.length() - 4);
+        }
+        all_files.emplace_back(fileName, displayName);
+    }
+
+    // Create buttons for this grid (limited by GRID_BUTTONS_MAX)
+    int buttons_created = 0;
+    for (int i = start_index; i < all_files.size() && buttons_created < GRID_BUTTONS_MAX; i++, buttons_created++) {
+        int row = buttons_created / GRID_COLS;
+        int col = buttons_created % GRID_COLS;
+
+        lv_obj_t* btn = lv_button_create(grid);
+        lv_obj_set_grid_cell(btn, LV_GRID_ALIGN_STRETCH, col, 1, LV_GRID_ALIGN_STRETCH, row, 1);
+        lv_obj_add_event_cb(btn, file_list_event_handler, LV_EVENT_CLICKED, nullptr); // Only listen for clicks
+
+        // Find button configuration for styling
+        ButtonConfig* config = nullptr;
+        for (auto& cfg : buttonConfigs) {
+            if (cfg.filename == all_files[i].first) {
+                config = &cfg;
+                break;
+            }
+        }
+
+        if (config) {
+            // Use configured color
+            lv_color_t btnColor = getColorFromName(config->color);
+            lv_obj_set_style_bg_color(btn, btnColor, LV_PART_MAIN);
+
+            // Set text color based on background brightness
+            lv_color_t textColor = shouldUseWhiteText(config->color) ?
+                lv_color_hex(0xFFFFFF) : lv_color_hex(0x000000);
+
+            lv_obj_t* label = lv_label_create(btn);
+            lv_label_set_text(label, config->label.c_str());
+            lv_obj_center(label);
+            lv_obj_set_style_text_color(label, textColor, LV_PART_MAIN);
+
+            // Store filename in user data - use the persistent string from buttonConfigs
+            lv_obj_set_user_data(btn, (void*)config->filename.c_str());
+        } else {
+            // Use default styling for unconfigured files
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x808080), LV_PART_MAIN);  // Gray
+
+            lv_obj_t* label = lv_label_create(btn);
+            lv_label_set_text(label, all_files[i].second.c_str());
+            lv_obj_center(label);
+            lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+
+            // For unconfigured files, we need to find the persistent string from unconfiguredFiles vector
+            // Find the original string in the unconfiguredFiles vector
+            const char* persistent_filename = nullptr;
+            for (const auto& unconfiguredFile : unconfigured) {
+                if (unconfiguredFile == all_files[i].first) {
+                    persistent_filename = unconfiguredFile.c_str();
+                    break;
+                }
+            }
+            lv_obj_set_user_data(btn, (void*)persistent_filename);
+        }
+    }
+
+    return grid;
 }
 
 void setup() {
@@ -430,83 +542,47 @@ void setup() {
     // Initialize audio system
     initializeAudio();
 
-    // Create scrollable file list container
-    file_list = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(file_list, 300, 220);
-    lv_obj_center(file_list);
+    // Set volume from configuration
+    delay(100); // Allow time for audio system to initialize
+    audioSetVolume(configuredVolume);
+    Serial.println("Audio volume set to: " + String(configuredVolume) + "/21");
 
-    // Configure scrolling behavior
-    lv_obj_set_scroll_dir(file_list, LV_DIR_VER);
+    // Create horizontal scrolling container for grids - now uses full screen height
+    file_list = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(file_list, TFT_HOR_RES, TFT_VER_RES); // Use full screen size
+    lv_obj_center(file_list); // Center on screen
+
+    // Configure horizontal scrolling with snap
+    lv_obj_set_scroll_dir(file_list, LV_DIR_HOR);
+    lv_obj_set_scroll_snap_x(file_list, LV_SCROLL_SNAP_CENTER);
     lv_obj_set_scrollbar_mode(file_list, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_add_flag(file_list, LV_OBJ_FLAG_SCROLL_ELASTIC);
 
-    // Arrange items vertically
-    lv_obj_set_flex_flow(file_list, LV_FLEX_FLOW_COLUMN);
+    // Set flex layout for horizontal arrangement
+    lv_obj_set_flex_flow(file_list, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(file_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(file_list, 0, 0);
+    lv_obj_set_style_pad_gap(file_list, GRID_GAP, 0); // Use configurable gap between grids
 
-    // Create buttons for configured files that were found (in config order)
+    // Calculate total files
+    int total_configured = 0;
     for (const auto& config : buttonConfigs) {
-        if (config.found) {
-            lv_obj_t * btn = lv_button_create(file_list);
-            lv_obj_set_size(btn, 280, 40);
-            lv_obj_add_event_cb(btn, file_list_event_handler, LV_EVENT_ALL, nullptr);
-
-            // Set button color based on configuration
-            lv_color_t btnColor = getColorFromName(config.color);
-            lv_obj_set_style_bg_color(btn, btnColor, LV_PART_MAIN);
-
-            // Store filename in user data for event handler
-            lv_obj_set_user_data(btn, (void*)config.filename.c_str());
-
-            // Add label with custom text
-            lv_obj_t * label = lv_label_create(btn);
-            lv_label_set_text(label, config.label.c_str());
-            lv_obj_center(label);
-
-            // Set text color based on background brightness
-            lv_color_t textColor = shouldUseWhiteText(config.color) ?
-                lv_color_hex(0xFFFFFF) : lv_color_hex(0x000000);
-            lv_obj_set_style_text_color(label, textColor, LV_PART_MAIN);
-        }
+        if (config.found) total_configured++;
     }
+    int total_files = total_configured + unconfiguredFiles.size();
 
-    // Create buttons for unconfigured MP3 files with default styling
-    for (const auto& fileName : unconfiguredFiles) {
-        lv_obj_t * btn = lv_button_create(file_list);
-        lv_obj_set_size(btn, 280, 40);
-        lv_obj_add_event_cb(btn, file_list_event_handler, LV_EVENT_ALL, nullptr);
+    // Create grids using configurable grid size
+    int num_grids = (total_files + GRID_BUTTONS_MAX - 1) / GRID_BUTTONS_MAX; // Ceiling division
 
-        // Set default color
-        lv_obj_set_style_bg_color(btn, lv_color_hex(0x808080), LV_PART_MAIN);  // Gray
+    Serial.println("Grid config: " + String(GRID_COLS) + "x" + String(GRID_ROWS) +
+                   " (" + String(GRID_BUTTONS_MAX) + " buttons per grid)");
+    Serial.println("Creating " + String(num_grids) + " grids for " + String(total_files) + " files");
 
-        // Store filename in user data for event handler
-        lv_obj_set_user_data(btn, (void*)fileName.c_str());
-
-        // Use filename as label (remove .mp3 extension for cleaner look)
-        lv_obj_t * label = lv_label_create(btn);
-        String displayName = fileName;
-        if (displayName.endsWith(".mp3") || displayName.endsWith(".MP3")) {
-            displayName = displayName.substring(0, displayName.length() - 4);
-        }
-        lv_label_set_text(label, displayName.c_str());
-        lv_obj_center(label);
-
-        // White text on gray background
-        lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    for (int grid_index = 0; grid_index < num_grids; grid_index++) {
+        int start_index = grid_index * GRID_BUTTONS_MAX;
+        lv_obj_t* grid = create_button_grid(file_list, buttonConfigs, unconfiguredFiles, start_index);
+        // Grid is automatically added to the flex container
     }
-
-    // Create volume slider
-    volSlider = lv_slider_create(lv_scr_act());
-    lv_obj_set_size(volSlider, 200, 20);
-    lv_obj_align(volSlider, LV_ALIGN_TOP_MID, 0, 10);
-    lv_slider_set_range(volSlider, 0, 21);
-    lv_slider_set_value(volSlider, 10, LV_ANIM_OFF);  // Default to 50%
-    lv_obj_add_event_cb(volSlider, volSlider_event_cb, LV_EVENT_ALL, nullptr);
-
-    // Create volume label
-    volSlider_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(volSlider_label, "Volume: 10/21");
-    lv_obj_align(volSlider_label, LV_ALIGN_TOP_MID, 0, 40);
 
     Serial.println("Setup complete!");
 }
