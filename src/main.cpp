@@ -18,6 +18,7 @@
 #include <FS.h>
 #include <vector>
 #include "CYD28_audio.h"
+#include <TFT_eSPI.h>
 
 // Pin definitions for CYD hardware
 #define XPT2046_IRQ 36
@@ -33,7 +34,8 @@
 // Display configuration
 #define TFT_HOR_RES   320
 #define TFT_VER_RES   240
-#define DRAW_BUF_SIZE (TFT_HOR_RES * TFT_VER_RES / 10 * (LV_COLOR_DEPTH / 8))
+// Reduce buffer size for better performance - use smaller buffer
+#define DRAW_BUF_SIZE (TFT_HOR_RES * 60) // Much smaller buffer for better performance
 
 // Grid configuration - adjust these for performance tuning
 #define GRID_COLS 4        // Number of columns per grid (was 5)
@@ -41,6 +43,10 @@
 #define GRID_BUTTONS_MAX (GRID_COLS * GRID_ROWS)  // Maximum buttons per grid
 #define BUTTON_GAP 1       // Gap between buttons in pixels
 #define GRID_GAP 2         // Gap between grids in pixels
+
+// Performance optimization settings
+#define SCROLL_THROW_SLOW 15    // Slower scroll deceleration for smoother performance
+#define SCROLL_MOMENTUM_REDUCE 90 // Reduce momentum for better control
 
 // Default volume setting (0-21 range)
 #define DEFAULT_VOLUME 12  // Default volume if not specified in config file
@@ -71,6 +77,10 @@ lv_obj_t * file_list;     // Container for file buttons
 
 std::vector<ButtonConfig> buttonConfigs;  // Configured buttons
 std::vector<String> unconfiguredFiles;    // MP3 files not in config
+
+// Visual feedback variables
+lv_obj_t * currentlyPlayingButton = nullptr;  // Track which button is currently playing
+lv_color_t originalButtonColor;               // Store original color to restore later
 
 // Global configuration variables
 int configuredVolume = DEFAULT_VOLUME;    // Volume setting from config file
@@ -112,60 +122,27 @@ void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
     }
 }
 
-/* Convert color name to LVGL color */
-lv_color_t getColorFromName(const String& colorName) {
-    // Check if it's a hex color (starts with # or 0x)
-    if (colorName.startsWith("#")) {
+/* Convert hex color to LVGL color */
+lv_color_t getColorFromHex(const String& colorHex) {
+    // Check if it's a hex color (starts with #)
+    if (colorHex.startsWith("#")) {
         // Parse hex color starting with #
-        String hexStr = colorName.substring(1);
-        if (hexStr.length() == 6) {
-            long hexValue = strtol(hexStr.c_str(), nullptr, 16);
-            return lv_color_hex(hexValue);
-        }
-    } else if (colorName.startsWith("0x") || colorName.startsWith("0X")) {
-        // Parse hex color starting with 0x
-        String hexStr = colorName.substring(2);
+        String hexStr = colorHex.substring(1);
         if (hexStr.length() == 6) {
             long hexValue = strtol(hexStr.c_str(), nullptr, 16);
             return lv_color_hex(hexValue);
         }
     }
-
-    // Check named colors
-    if (colorName == "red") return lv_color_hex(0xFF0000);
-    if (colorName == "green") return lv_color_hex(0x00FF00);
-    if (colorName == "blue") return lv_color_hex(0x0000FF);
-    if (colorName == "yellow") return lv_color_hex(0xFFFF00);
-    if (colorName == "orange") return lv_color_hex(0xFF8000);
-    if (colorName == "purple") return lv_color_hex(0x800080);
-    if (colorName == "pink") return lv_color_hex(0xFF69B4);
-    if (colorName == "cyan") return lv_color_hex(0x00FFFF);
-    if (colorName == "lime") return lv_color_hex(0x32CD32);
-    if (colorName == "magenta") return lv_color_hex(0xFF00FF);
-    if (colorName == "brown") return lv_color_hex(0x8B4513);
-    if (colorName == "gray") return lv_color_hex(0x808080);
-    if (colorName == "white") return lv_color_hex(0xFFFFFF);
-    if (colorName == "black") return lv_color_hex(0x000000);
 
     // Default color if not recognized
     return lv_color_hex(0x2196F3);  // Material blue
 }
 
 /* Determine if text should be white or black based on background color brightness */
-bool shouldUseWhiteText(const String& colorName) {
-    // For simplicity, use a predefined list of dark colors that need white text
-    // This avoids LVGL version compatibility issues with color extraction
-
-    if (colorName == "black" || colorName == "brown" || colorName == "purple" ||
-        colorName == "blue" || colorName == "red" || colorName == "green") {
-        return true;  // Use white text on dark backgrounds
-    }
-
-    // Check if it's a dark hex color (rough approximation)
-    if (colorName.startsWith("#") || colorName.startsWith("0x") || colorName.startsWith("0X")) {
-        String hexStr = colorName;
-        if (hexStr.startsWith("#")) hexStr = hexStr.substring(1);
-        else if (hexStr.startsWith("0x") || hexStr.startsWith("0X")) hexStr = hexStr.substring(2);
+bool shouldUseWhiteText(const String& colorHex) {
+    // Check if it's a hex color starting with #
+    if (colorHex.startsWith("#")) {
+        String hexStr = colorHex.substring(1);
 
         if (hexStr.length() == 6) {
             long hexValue = strtol(hexStr.c_str(), nullptr, 16);
@@ -179,7 +156,7 @@ bool shouldUseWhiteText(const String& colorName) {
         }
     }
 
-    // Default to black text for light colors
+    // Default to black text for unrecognized colors
     return false;
 }
 
@@ -334,7 +311,7 @@ void scanSDCard() {
         }
 
         file.close(); // Properly close each file
-        delay(10); // Small delay between file operations
+        // delay(10); // Small delay between file operations
         file = root.openNextFile();
     }
 
@@ -394,16 +371,83 @@ void stopAudio() {
     }
 }
 
+/* Set button to playing state (red color) */
+void setButtonPlaying(lv_obj_t* btn) {
+    if (btn == nullptr) return;
+
+    // Store the original color before changing to red
+    originalButtonColor = lv_obj_get_style_bg_color(btn, LV_PART_MAIN);
+
+    // Set button to red to indicate playing
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0xFF0000), LV_PART_MAIN); // Bright red
+
+    // Set text to white for better contrast on red
+    lv_obj_t* label = lv_obj_get_child(btn, 0);
+    if (label) {
+        lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    }
+
+    currentlyPlayingButton = btn;
+}
+
+/* Restore button to original state */
+void restoreButtonColor(lv_obj_t* btn) {
+    if (btn == nullptr) return;
+
+    // Restore original background color
+    lv_obj_set_style_bg_color(btn, originalButtonColor, LV_PART_MAIN);
+
+    // Find the original button configuration to restore proper text color
+    const char* filename = (const char*)lv_obj_get_user_data(btn);
+    if (filename) {
+        // Look for the button configuration
+        for (const auto& config : buttonConfigs) {
+            if (config.filename == String(filename)) {
+                // Restore proper text color based on background brightness
+                lv_color_t textColor = shouldUseWhiteText(config.color) ?
+                    lv_color_hex(0xFFFFFF) : lv_color_hex(0x000000);
+
+                lv_obj_t* label = lv_obj_get_child(btn, 0);
+                if (label) {
+                    lv_obj_set_style_text_color(label, textColor, LV_PART_MAIN);
+                }
+                return;
+            }
+        }
+
+        // If not found in config (unconfigured file), use white text on gray
+        lv_obj_t* label = lv_obj_get_child(btn, 0);
+        if (label) {
+            lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+        }
+    }
+}
+
+/* Reset all button colors (call when audio stops) */
+void resetAllButtonColors() {
+    if (currentlyPlayingButton != nullptr) {
+        restoreButtonColor(currentlyPlayingButton);
+        currentlyPlayingButton = nullptr;
+    }
+}
+
 /* Handle button clicks on file list items */
 static void file_list_event_handler(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t * obj = lv_event_get_target_obj(e);
 
     if (code == LV_EVENT_CLICKED) {
+        // Reset any previously playing button
+        resetAllButtonColors();
+
         // Get filename from user data
         const char* filename = (const char*)lv_obj_get_user_data(obj);
         if (filename) {
             Serial.println("Selected file: " + String(filename));
+
+            // Set this button to playing state (red)
+            setButtonPlaying(obj);
+
             playMP3File(String(filename));  // Play the selected MP3 file
         }
     }
@@ -411,11 +455,13 @@ static void file_list_event_handler(lv_event_t * e) {
 
 /* Create a configurable grid of buttons within a container */
 lv_obj_t* create_button_grid(lv_obj_t* parent, const std::vector<ButtonConfig>& configs, const std::vector<String>& unconfigured, int start_index) {
-    // Create grid container with full screen height
+    // Create grid container with full screen size - no margins
     lv_obj_t* grid = lv_obj_create(parent);
-    lv_obj_set_size(grid, TFT_HOR_RES - 10, TFT_VER_RES - 10); // Use full screen size minus small margin
-    lv_obj_set_style_pad_all(grid, BUTTON_GAP, 0); // Use configurable padding
-    lv_obj_set_style_pad_gap(grid, BUTTON_GAP, 0); // Use configurable gap
+    lv_obj_set_size(grid, TFT_HOR_RES, TFT_VER_RES); // Use full screen size without any margins
+    lv_obj_set_style_pad_all(grid, 0, 0); // Remove all padding around the grid
+    lv_obj_set_style_pad_gap(grid, BUTTON_GAP, 0); // Keep small gap between buttons
+    lv_obj_set_style_border_width(grid, 0, 0); // Remove grid border
+    lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0); // Make grid background transparent
     lv_obj_remove_flag(grid, LV_OBJ_FLAG_SCROLLABLE); // Grid itself shouldn't scroll
 
     // Dynamically create grid descriptors based on configuration
@@ -466,6 +512,13 @@ lv_obj_t* create_button_grid(lv_obj_t* parent, const std::vector<ButtonConfig>& 
         lv_obj_set_grid_cell(btn, LV_GRID_ALIGN_STRETCH, col, 1, LV_GRID_ALIGN_STRETCH, row, 1);
         lv_obj_add_event_cb(btn, file_list_event_handler, LV_EVENT_CLICKED, nullptr); // Only listen for clicks
 
+        // Performance optimization: Disable rounded corners and shadows
+        lv_obj_set_style_radius(btn, 0, LV_PART_MAIN); // Square corners instead of rounded
+        lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN); // Disable drop shadow
+        lv_obj_set_style_shadow_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN); // Make shadow transparent
+        lv_obj_set_style_border_width(btn, 1, LV_PART_MAIN); // Thin border for button definition
+        lv_obj_set_style_border_color(btn, lv_color_hex(0x404040), LV_PART_MAIN); // Dark border
+
         // Find button configuration for styling
         ButtonConfig* config = nullptr;
         for (auto& cfg : buttonConfigs) {
@@ -477,7 +530,7 @@ lv_obj_t* create_button_grid(lv_obj_t* parent, const std::vector<ButtonConfig>& 
 
         if (config) {
             // Use configured color
-            lv_color_t btnColor = getColorFromName(config->color);
+            lv_color_t btnColor = getColorFromHex(config->color);
             lv_obj_set_style_bg_color(btn, btnColor, LV_PART_MAIN);
 
             // Set text color based on background brightness
@@ -516,9 +569,19 @@ lv_obj_t* create_button_grid(lv_obj_t* parent, const std::vector<ButtonConfig>& 
     return grid;
 }
 
+TFT_eSPI tft = TFT_eSPI();
+
 void setup() {
     Serial.begin(115200);
     Serial.println("CYD Soundboard starting...");
+
+    // Initialize TFT display early so we can show a loading message before LVGL
+    tft.begin();
+    tft.setRotation(3); // Set to 3 for correct orientation (was 1)
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.drawString("Lol jonge doe rustig, ff laden", TFT_HOR_RES/2, TFT_VER_RES/2);
 
     // Initialize touch screen (uses software SPI)
     touchscreen.begin();
@@ -550,13 +613,20 @@ void setup() {
     // Create horizontal scrolling container for grids - now uses full screen height
     file_list = lv_obj_create(lv_screen_active());
     lv_obj_set_size(file_list, TFT_HOR_RES, TFT_VER_RES); // Use full screen size
-    lv_obj_center(file_list); // Center on screen
+    lv_obj_center(file_list);
 
     // Configure horizontal scrolling with snap
     lv_obj_set_scroll_dir(file_list, LV_DIR_HOR);
     lv_obj_set_scroll_snap_x(file_list, LV_SCROLL_SNAP_CENTER);
-    lv_obj_set_scrollbar_mode(file_list, LV_SCROLLBAR_MODE_AUTO);
-    lv_obj_add_flag(file_list, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_set_scrollbar_mode(file_list, LV_SCROLLBAR_MODE_OFF); // Disable scrollbar for better performance
+    lv_obj_add_flag(file_list, LV_OBJ_FLAG_SCROLL_ONE);
+
+    // Performance optimizations for scrolling - use alternative methods
+    lv_obj_set_style_anim_duration(file_list, 200, 0); // Faster animations for snappier feel
+
+    // Optimize rendering during scroll
+    lv_obj_add_flag(file_list, LV_OBJ_FLAG_SCROLL_ELASTIC); // Add elastic scroll for smoother feel
+    lv_obj_set_style_bg_opa(file_list, LV_OPA_TRANSP, 0); // Transparent background for better performance
 
     // Set flex layout for horizontal arrangement
     lv_obj_set_flex_flow(file_list, LV_FLEX_FLOW_ROW);
@@ -592,6 +662,19 @@ void loop() {
     lv_tick_inc(millis() - lastTick);
     lastTick = millis();
     lv_timer_handler();
+
+    // Check if audio has stopped playing and reset button color
+    static bool wasPlaying = false;
+    bool isCurrentlyPlaying = audioIsPlaying();
+
+    if (wasPlaying && !isCurrentlyPlaying) {
+        // Audio just stopped, reset button colors
+        resetAllButtonColors();
+        currentlyPlaying = "";
+        Serial.println("Audio playback ended - button color reset");
+    }
+
+    wasPlaying = isCurrentlyPlaying;
 
     // No need to process audio manually - CYD28_audio handles it in its own task
     delay(5);
