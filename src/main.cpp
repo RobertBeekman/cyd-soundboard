@@ -27,6 +27,7 @@
 #define XPT2046_CLK 25
 #define XPT2046_CS 33
 #define SD_CS 5
+#define TFT_BL 21      // Display backlight control pin
 
 // Configuration file name
 #define CONFIG_FILE "/soundboard.conf"
@@ -48,8 +49,9 @@
 #define SCROLL_THROW_SLOW 15    // Slower scroll deceleration for smoother performance
 #define SCROLL_MOMENTUM_REDUCE 90 // Reduce momentum for better control
 
-// Default volume setting (0-21 range)
-#define DEFAULT_VOLUME 12  // Default volume if not specified in config file
+// Default settings
+#define DEFAULT_VOLUME 12           // Default volume if not specified in config file
+#define DEFAULT_SCREEN_TIMEOUT 30   // Default screen timeout in seconds
 
 // Structure to hold button configuration
 struct ButtonConfig {
@@ -83,7 +85,14 @@ lv_obj_t * currentlyPlayingButton = nullptr;  // Track which button is currently
 lv_color_t originalButtonColor;               // Store original color to restore later
 
 // Global configuration variables
-int configuredVolume = DEFAULT_VOLUME;    // Volume setting from config file
+int configuredVolume = DEFAULT_VOLUME;        // Volume setting from config file
+int configuredScreenTimeout = DEFAULT_SCREEN_TIMEOUT; // Screen timeout in seconds
+
+// Screen timeout variables
+unsigned long lastTouchTime = 0;     // Last time screen was touched
+bool screenOn = true;                // Current screen state
+bool touchWakeupMode = false;        // True when screen is off and waiting for wake touch
+bool ignoreUntilRelease = false;     // True when we should ignore touches until finger is lifted
 
 // Global SD card initialization flag
 bool sdCardInitialized = false;
@@ -112,12 +121,37 @@ void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
     TouchPoint p = touchscreen.getTouch();
 
     if (p.zRaw > 0) {  // Touch detected
+        // Update last touch time
+        lastTouchTime = millis();
+
+        // If screen is off (wake-up mode), turn it on and start ignoring touches until release
+        if (touchWakeupMode) {
+            screenOn = true;
+            touchWakeupMode = false;
+            ignoreUntilRelease = true;  // Start ignoring all touches until finger is lifted
+            digitalWrite(TFT_BL, HIGH); // Turn on backlight
+            Serial.println("Screen woken up by touch - ignoring input until release");
+        }
+
+        // If we're in ignore mode, don't process any touches
+        if (ignoreUntilRelease) {
+            data->state = LV_INDEV_STATE_RELEASED;
+            data->point.x = 0;
+            data->point.y = 0;
+            return;
+        }
+
         // Map raw touch coordinates to screen pixels
         // Note: Coordinates are inverted to match upside-down display
         data->point.x = map(p.x, touchScreenMinimumX, touchScreenMaximumX, TFT_HOR_RES, 1);
         data->point.y = map(p.y, touchScreenMinimumY, touchScreenMaximumY, TFT_VER_RES, 1);
         data->state = LV_INDEV_STATE_PRESSED;
     } else {
+        // No touch detected - finger released
+        if (ignoreUntilRelease) {
+            ignoreUntilRelease = false;  // Stop ignoring touches now that finger is lifted
+            Serial.println("Touch released - accepting input again");
+        }
         data->state = LV_INDEV_STATE_RELEASED;
     }
 }
@@ -222,6 +256,18 @@ void readConfigFile() {
             continue;
         }
 
+        // Check for screen timeout setting (format: TIMEOUT=30)
+        if (line.startsWith("TIMEOUT=")) {
+            int timeout = line.substring(8).toInt();
+            if (timeout >= 1 && timeout <= 3600) { // Reasonable range for timeout
+                configuredScreenTimeout = timeout;
+                Serial.println("Screen timeout configured to: " + String(timeout) + " seconds");
+            } else {
+                Serial.println("Invalid screen timeout value: " + String(timeout) + ", using default");
+            }
+            continue;
+        }
+
         // Parse button format: filename|label|color
         int firstPipe = line.indexOf('|');
         int secondPipe = line.indexOf('|', firstPipe + 1);
@@ -240,7 +286,7 @@ void readConfigFile() {
     }
 
     configFile.close();
-    Serial.println("Configuration loaded: " + String(buttonConfigs.size()) + " entries, Volume: " + String(configuredVolume) + "/21");
+    Serial.println("Configuration loaded: " + String(buttonConfigs.size()) + " entries, Volume: " + String(configuredVolume) + "/21, Timeout: " + String(configuredScreenTimeout) + "s");
 }
 
 /* Scan SD card root directory and populate file list */
@@ -437,18 +483,26 @@ static void file_list_event_handler(lv_event_t * e) {
     lv_obj_t * obj = lv_event_get_target_obj(e);
 
     if (code == LV_EVENT_CLICKED) {
-        // Reset any previously playing button
-        resetAllButtonColors();
-
         // Get filename from user data
         const char* filename = (const char*)lv_obj_get_user_data(obj);
         if (filename) {
-            Serial.println("Selected file: " + String(filename));
+            // Check if this is the currently playing button
+            if (currentlyPlayingButton == obj && audioIsPlaying()) {
+                // Stop playback if clicking the same button that's currently playing
+                Serial.println("Stopping playback: " + String(filename));
+                stopAudio();
+                resetAllButtonColors();
+            } else {
+                // Reset any previously playing button
+                resetAllButtonColors();
 
-            // Set this button to playing state (red)
-            setButtonPlaying(obj);
+                Serial.println("Selected file: " + String(filename));
 
-            playMP3File(String(filename));  // Play the selected MP3 file
+                // Set this button to playing state (red)
+                setButtonPlaying(obj);
+
+                playMP3File(String(filename));  // Play the selected MP3 file
+            }
         }
     }
 }
@@ -539,7 +593,12 @@ lv_obj_t* create_button_grid(lv_obj_t* parent, const std::vector<ButtonConfig>& 
 
             lv_obj_t* label = lv_label_create(btn);
             lv_label_set_text(label, config->label.c_str());
+
+            // Enable text wrapping and use full button width (no padding)
+            lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(label, lv_pct(100)); // Use 100% of button width - no padding
             lv_obj_center(label);
+            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
             lv_obj_set_style_text_color(label, textColor, LV_PART_MAIN);
 
             // Store filename in user data - use the persistent string from buttonConfigs
@@ -550,7 +609,12 @@ lv_obj_t* create_button_grid(lv_obj_t* parent, const std::vector<ButtonConfig>& 
 
             lv_obj_t* label = lv_label_create(btn);
             lv_label_set_text(label, all_files[i].second.c_str());
+
+            // Enable text wrapping and use full button width (no padding)
+            lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+            lv_obj_set_width(label, lv_pct(100)); // Use 100% of button width - no padding
             lv_obj_center(label);
+            lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
             lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
 
             // For unconfigured files, we need to find the persistent string from unconfiguredFiles vector
@@ -574,6 +638,15 @@ TFT_eSPI tft = TFT_eSPI();
 void setup() {
     Serial.begin(115200);
     Serial.println("CYD Soundboard starting...");
+
+    // Initialize backlight control pin
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, HIGH); // Turn on backlight initially
+
+    // Initialize screen timeout variables
+    lastTouchTime = millis();
+    screenOn = true;
+    touchWakeupMode = false;
 
     // Initialize TFT display early so we can show a loading message before LVGL
     tft.begin();
@@ -662,6 +735,18 @@ void loop() {
     lv_tick_inc(millis() - lastTick);
     lastTick = millis();
     lv_timer_handler();
+
+    // Handle screen timeout functionality
+    unsigned long currentTime = millis();
+    if (screenOn && !touchWakeupMode) {
+        // Check if screen should timeout
+        if (currentTime - lastTouchTime > (configuredScreenTimeout * 1000UL)) {
+            screenOn = false;
+            touchWakeupMode = true;
+            digitalWrite(TFT_BL, LOW); // Turn off backlight
+            Serial.println("Screen timeout - display turned off");
+        }
+    }
 
     // Check if audio has stopped playing and reset button color
     static bool wasPlaying = false;
