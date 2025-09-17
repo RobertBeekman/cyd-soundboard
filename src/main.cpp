@@ -39,9 +39,8 @@
 #define DRAW_BUF_SIZE (TFT_HOR_RES * 60) // Much smaller buffer for better performance
 
 // Grid configuration - adjust these for performance tuning
-#define GRID_COLS 4        // Number of columns per grid (was 5)
-#define GRID_ROWS 3        // Number of rows per grid (was 6)
-#define GRID_BUTTONS_MAX (GRID_COLS * GRID_ROWS)  // Maximum buttons per grid
+#define DEFAULT_GRID_COLS 4        // Default number of columns per grid
+#define DEFAULT_GRID_ROWS 3        // Default number of rows per grid
 #define BUTTON_GAP 1       // Gap between buttons in pixels
 #define GRID_GAP 2         // Gap between grids in pixels
 
@@ -52,6 +51,7 @@
 // Default settings
 #define DEFAULT_VOLUME 12           // Default volume if not specified in config file
 #define DEFAULT_SCREEN_TIMEOUT 30   // Default screen timeout in seconds
+#define DEFAULT_FONT_SIZE 14        // Default font size for button text
 
 // Structure to hold button configuration
 struct ButtonConfig {
@@ -60,6 +60,7 @@ struct ButtonConfig {
     String color;
     int order = 0;
     bool found = false;  // Whether the MP3 file was found on SD card
+    int fontSize = 0;    // Font size override (0 = use global setting)
 };
 
 // Touch screen setup using software SPI to avoid conflicts
@@ -87,6 +88,10 @@ lv_color_t originalButtonColor;               // Store original color to restore
 // Global configuration variables
 int configuredVolume = DEFAULT_VOLUME;        // Volume setting from config file
 int configuredScreenTimeout = DEFAULT_SCREEN_TIMEOUT; // Screen timeout in seconds
+int configuredGridCols = DEFAULT_GRID_COLS;   // Number of columns per grid
+int configuredGridRows = DEFAULT_GRID_ROWS;   // Number of rows per grid
+int configuredGridButtonsMax = DEFAULT_GRID_COLS * DEFAULT_GRID_ROWS; // Maximum buttons per grid
+int configuredFontSize = DEFAULT_FONT_SIZE;   // Font size for button text
 
 // Screen timeout variables
 unsigned long lastTouchTime = 0;     // Last time screen was touched
@@ -194,6 +199,31 @@ bool shouldUseWhiteText(const String& colorHex) {
     return false;
 }
 
+/* Set font based on size - helper function to avoid code duplication */
+void setFontBySize(lv_obj_t* label, int fontSize) {
+    if (fontSize <= 12) {
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, LV_PART_MAIN);
+    } else if (fontSize <= 14) {
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_14, LV_PART_MAIN);
+    } else if (fontSize <= 16) {
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_16, LV_PART_MAIN);
+    } else if (fontSize <= 18) {
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_18, LV_PART_MAIN);
+    } else if (fontSize <= 20) {
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_20, LV_PART_MAIN);
+    } else if (fontSize <= 22) {
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_22, LV_PART_MAIN);
+    } else if (fontSize <= 24) {
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_24, LV_PART_MAIN);
+    } else if (fontSize <= 26) {
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_26, LV_PART_MAIN);
+    } else if (fontSize <= 28) {
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_28, LV_PART_MAIN);
+    } else {
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_32, LV_PART_MAIN);
+    }
+}
+
 /* Initialize SD card once and keep it available */
 bool initializeSDCard() {
     if (sdCardInitialized) {
@@ -219,6 +249,10 @@ bool initializeSDCard() {
 void readConfigFile() {
     buttonConfigs.clear();
     configuredVolume = DEFAULT_VOLUME; // Reset to default
+    configuredScreenTimeout = DEFAULT_SCREEN_TIMEOUT; // Reset to default
+    configuredGridCols = DEFAULT_GRID_COLS; // Reset to default
+    configuredGridRows = DEFAULT_GRID_ROWS; // Reset to default
+    configuredFontSize = DEFAULT_FONT_SIZE; // Reset to default
 
     // Initialize SD card if not already done
     if (!initializeSDCard()) {
@@ -229,6 +263,7 @@ void readConfigFile() {
     File configFile = SD.open(CONFIG_FILE);
     if (!configFile) {
         Serial.println("Configuration file not found, using default settings");
+        configuredGridButtonsMax = configuredGridCols * configuredGridRows; // Calculate with defaults
         return;
     }
 
@@ -268,25 +303,79 @@ void readConfigFile() {
             continue;
         }
 
-        // Parse button format: filename|label|color
+        // Check for grid columns setting (format: GRID_COLS=4)
+        if (line.startsWith("GRID_COLS=")) {
+            int cols = line.substring(10).toInt();
+            if (cols >= 1 && cols <= 10) { // Reasonable range for columns
+                configuredGridCols = cols;
+                Serial.println("Grid columns configured to: " + String(cols));
+            } else {
+                Serial.println("Invalid grid columns value: " + String(cols) + ", using default");
+            }
+            continue;
+        }
+
+        // Check for grid rows setting (format: GRID_ROWS=3)
+        if (line.startsWith("GRID_ROWS=")) {
+            int rows = line.substring(10).toInt();
+            if (rows >= 1 && rows <= 10) { // Reasonable range for rows
+                configuredGridRows = rows;
+                Serial.println("Grid rows configured to: " + String(rows));
+            } else {
+                Serial.println("Invalid grid rows value: " + String(rows) + ", using default");
+            }
+            continue;
+        }
+
+        // Check for font size setting (format: FONT_SIZE=14)
+        if (line.startsWith("FONT_SIZE=")) {
+            int fontSize = line.substring(10).toInt();
+            if (fontSize >= 8 && fontSize <= 32) { // Reasonable range for font size
+                configuredFontSize = fontSize;
+                Serial.println("Font size configured to: " + String(fontSize));
+            } else {
+                Serial.println("Invalid font size value: " + String(fontSize) + ", using default");
+            }
+            continue;
+        }
+
+        // Parse button format: filename|label|color|fontSize (fontSize is optional)
         int firstPipe = line.indexOf('|');
         int secondPipe = line.indexOf('|', firstPipe + 1);
+        int thirdPipe = line.indexOf('|', secondPipe + 1);
 
         if (firstPipe > 0 && secondPipe > firstPipe) {
             ButtonConfig config;
             config.filename = line.substring(0, firstPipe);
             config.label = line.substring(firstPipe + 1, secondPipe);
-            config.color = line.substring(secondPipe + 1);
+            config.color = line.substring(secondPipe + 1, thirdPipe > secondPipe ? thirdPipe : line.length());
             config.order = order++;
             config.found = false;
+            config.fontSize = 0; // Default to use global setting
+
+            // Check if there's a fourth field for font size
+            if (thirdPipe > secondPipe) {
+                int fontSize = line.substring(thirdPipe + 1).toInt();
+                if (fontSize >= 8 && fontSize <= 32) {
+                    config.fontSize = fontSize;
+                    Serial.println("Config: " + config.filename + " -> " + config.label + " (" + config.color + ", font: " + String(fontSize) + ")");
+                } else {
+                    Serial.println("Config: " + config.filename + " -> " + config.label + " (" + config.color + ", invalid font: " + String(fontSize) + ")");
+                }
+            } else {
+                Serial.println("Config: " + config.filename + " -> " + config.label + " (" + config.color + ")");
+            }
 
             buttonConfigs.push_back(config);
-            Serial.println("Config: " + config.filename + " -> " + config.label + " (" + config.color + ")");
         }
     }
 
     configFile.close();
-    Serial.println("Configuration loaded: " + String(buttonConfigs.size()) + " entries, Volume: " + String(configuredVolume) + "/21, Timeout: " + String(configuredScreenTimeout) + "s");
+
+    // Calculate max buttons per grid after reading configuration
+    configuredGridButtonsMax = configuredGridCols * configuredGridRows;
+
+    Serial.println("Configuration loaded: " + String(buttonConfigs.size()) + " entries, Volume: " + String(configuredVolume) + "/21, Timeout: " + String(configuredScreenTimeout) + "s, Grid: " + String(configuredGridCols) + "x" + String(configuredGridRows) + ", Font: " + String(configuredFontSize));
 }
 
 /* Scan SD card root directory and populate file list */
@@ -519,20 +608,21 @@ lv_obj_t* create_button_grid(lv_obj_t* parent, const std::vector<ButtonConfig>& 
     lv_obj_remove_flag(grid, LV_OBJ_FLAG_SCROLLABLE); // Grid itself shouldn't scroll
 
     // Dynamically create grid descriptors based on configuration
-    static int32_t col_dsc[GRID_COLS + 1];
-    static int32_t row_dsc[GRID_ROWS + 1];
+    // Allocate arrays with maximum possible size (10x10 as per validation limits)
+    static int32_t col_dsc[11]; // Max 10 columns + terminator
+    static int32_t row_dsc[11]; // Max 10 rows + terminator
 
-    // Fill column descriptors
-    for (int i = 0; i < GRID_COLS; i++) {
+    // Fill column descriptors using configured grid columns
+    for (int i = 0; i < configuredGridCols; i++) {
         col_dsc[i] = LV_GRID_FR(1);
     }
-    col_dsc[GRID_COLS] = LV_GRID_TEMPLATE_LAST;
+    col_dsc[configuredGridCols] = LV_GRID_TEMPLATE_LAST;
 
-    // Fill row descriptors
-    for (int i = 0; i < GRID_ROWS; i++) {
+    // Fill row descriptors using configured grid rows
+    for (int i = 0; i < configuredGridRows; i++) {
         row_dsc[i] = LV_GRID_FR(1);
     }
-    row_dsc[GRID_ROWS] = LV_GRID_TEMPLATE_LAST;
+    row_dsc[configuredGridRows] = LV_GRID_TEMPLATE_LAST;
 
     lv_obj_set_grid_dsc_array(grid, col_dsc, row_dsc);
     lv_obj_set_layout(grid, LV_LAYOUT_GRID);
@@ -556,11 +646,11 @@ lv_obj_t* create_button_grid(lv_obj_t* parent, const std::vector<ButtonConfig>& 
         all_files.emplace_back(fileName, displayName);
     }
 
-    // Create buttons for this grid (limited by GRID_BUTTONS_MAX)
+    // Create buttons for this grid (limited by configuredGridButtonsMax)
     int buttons_created = 0;
-    for (int i = start_index; i < all_files.size() && buttons_created < GRID_BUTTONS_MAX; i++, buttons_created++) {
-        int row = buttons_created / GRID_COLS;
-        int col = buttons_created % GRID_COLS;
+    for (int i = start_index; i < all_files.size() && buttons_created < configuredGridButtonsMax; i++, buttons_created++) {
+        int row = buttons_created / configuredGridCols;
+        int col = buttons_created % configuredGridCols;
 
         lv_obj_t* btn = lv_button_create(grid);
         lv_obj_set_grid_cell(btn, LV_GRID_ALIGN_STRETCH, col, 1, LV_GRID_ALIGN_STRETCH, row, 1);
@@ -601,6 +691,10 @@ lv_obj_t* create_button_grid(lv_obj_t* parent, const std::vector<ButtonConfig>& 
             lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
             lv_obj_set_style_text_color(label, textColor, LV_PART_MAIN);
 
+            // Set font size - use per-button override if available, otherwise use global setting
+            int fontSizeToUse = (config->fontSize > 0) ? config->fontSize : configuredFontSize;
+            setFontBySize(label, fontSizeToUse);
+
             // Store filename in user data - use the persistent string from buttonConfigs
             lv_obj_set_user_data(btn, (void*)config->filename.c_str());
         } else {
@@ -616,6 +710,9 @@ lv_obj_t* create_button_grid(lv_obj_t* parent, const std::vector<ButtonConfig>& 
             lv_obj_center(label);
             lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
             lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+
+            // Set configurable font size for unconfigured files too
+            setFontBySize(label, configuredFontSize);
 
             // For unconfigured files, we need to find the persistent string from unconfiguredFiles vector
             // Find the original string in the unconfiguredFiles vector
@@ -715,14 +812,14 @@ void setup() {
     int total_files = total_configured + unconfiguredFiles.size();
 
     // Create grids using configurable grid size
-    int num_grids = (total_files + GRID_BUTTONS_MAX - 1) / GRID_BUTTONS_MAX; // Ceiling division
+    int num_grids = (total_files + configuredGridButtonsMax - 1) / configuredGridButtonsMax; // Ceiling division
 
-    Serial.println("Grid config: " + String(GRID_COLS) + "x" + String(GRID_ROWS) +
-                   " (" + String(GRID_BUTTONS_MAX) + " buttons per grid)");
+    Serial.println("Grid config: " + String(configuredGridCols) + "x" + String(configuredGridRows) +
+                   " (" + String(configuredGridButtonsMax) + " buttons per grid)");
     Serial.println("Creating " + String(num_grids) + " grids for " + String(total_files) + " files");
 
     for (int grid_index = 0; grid_index < num_grids; grid_index++) {
-        int start_index = grid_index * GRID_BUTTONS_MAX;
+        int start_index = grid_index * configuredGridButtonsMax;
         lv_obj_t* grid = create_button_grid(file_list, buttonConfigs, unconfiguredFiles, start_index);
         // Grid is automatically added to the flex container
     }
